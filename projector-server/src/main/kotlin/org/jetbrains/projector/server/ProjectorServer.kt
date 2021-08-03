@@ -25,6 +25,10 @@
 
 package org.jetbrains.projector.server
 
+import com.intellij.openapi.application.invokeAndWaitIfNeeded
+import com.intellij.openapi.application.runWriteAction
+import com.intellij.openapi.command.executeCommand
+import com.intellij.openapi.editor.EditorFactory
 import org.java_websocket.WebSocket
 import org.java_websocket.exceptions.WebsocketNotConnectedException
 import org.jetbrains.projector.awt.PClipboard
@@ -110,6 +114,8 @@ class ProjectorServer private constructor(
   }
 
   private val markdownQueue = ConcurrentLinkedQueue<ServerMarkdownEvent>()
+
+  private val speculativeQueue = ConcurrentLinkedQueue<Pair<SpeculativeEvent, String>>()
 
   private var windowColorsEvent: ServerWindowColorsEvent? = null
 
@@ -273,7 +279,7 @@ class ProjectorServer private constructor(
   }
 
   @OptIn(ExperimentalStdlibApi::class)
-  private fun createDataToSend(): List<ServerEvent> {
+  private fun createDataToSend(): List<FilterableEvent<*>> {
     val clipboardEvent = when (val clipboardContents = PClipboard.extractLastContents()) {
       null -> emptyList()
 
@@ -326,17 +332,26 @@ class ProjectorServer private constructor(
 
     val markdownEvents = extractData(markdownQueue)
 
-    val commandsCount = caretInfoEvents.size +
-                        newImagesCopy.size + clipboardEvent.size + drawCommands.size + windowSetChangedEvent.size + markdownEvents.size + 1
+    val speculativeEvents = extractData(speculativeQueue).map {
+      FilterableEvent(it.first) { _, settings -> it.second == settings.address }
+    }
+
+    val commandsCount = caretInfoEvents.size + newImagesCopy.size + clipboardEvent.size + drawCommands.size +
+                        windowSetChangedEvent.size + markdownEvents.size + speculativeEvents.size + 1
+
+    fun toFilterableEvent(event: ServerEvent): FilterableEvent<*> {
+      return FilterableEvent(event) { _, _ -> true }
+    }
 
     val allEvents = buildList(commandsCount) {
-      addAll(caretInfoEvents)
-      addAll(newImagesCopy)
-      addAll(clipboardEvent)
-      addAll(drawCommands)
-      addAll(windowSetChangedEvent)
-      addAll(markdownEvents)
-      windowColorsEvent?.let { add(it); windowColorsEvent = null }
+      addAll(caretInfoEvents.map(::toFilterableEvent))
+      addAll(newImagesCopy.map(::toFilterableEvent))
+      addAll(clipboardEvent.map(::toFilterableEvent))
+      addAll(drawCommands.map(::toFilterableEvent))
+      addAll(windowSetChangedEvent.map(::toFilterableEvent))
+      addAll(markdownEvents.map(::toFilterableEvent))
+      addAll(speculativeEvents)
+      windowColorsEvent?.let { add(toFilterableEvent(it)); windowColorsEvent = null }
     }
 
     ProjectorImageCacher.collectGarbage()
@@ -493,6 +508,45 @@ class ProjectorServer private constructor(
       }
 
       is ClientWindowCloseEvent -> SwingUtilities.invokeLater { PWindow.getWindow(message.windowId)?.close() }
+      is ClientSpeculativeKeyPressEvent -> {
+
+        val editor = EditorFactory.getInstance().allEditors.find {
+          System.identityHashCode(it) == message.editorId
+        }
+
+        if (editor == null) {
+          processMessage(clientSettings, message.originalEvent) // fallback
+        } else {
+
+          invokeAndWaitIfNeeded {
+            runWriteAction {
+              executeCommand {
+                val insertedString = message.originalEvent.char.toString()
+
+                val selectionInfo = message.selectionInfo
+
+                editor.document.apply {
+                  if (selectionInfo != null) {
+                    replaceString(selectionInfo.startOffset, selectionInfo.endOffset, insertedString)
+                  }
+                  else {
+                    insertString(message.offset, insertedString)
+                  }
+                }
+
+                val newOffset = (selectionInfo?.startOffset ?: message.offset) + insertedString.length
+
+                editor.caretModel.primaryCaret.apply {
+                  removeSelection()
+                  moveToOffset(newOffset)
+                }
+              }
+            }
+          }
+        }
+
+        speculativeQueue.add(SpeculativeEvent.SpeculativeStringDrawnEvent(message.requestId) to clientSettings.address!!)
+      }
     }
   }
 
@@ -642,13 +696,18 @@ class ProjectorServer private constructor(
     updateClientsCount()
   }
 
-  private fun sendPictures(dataToSend: List<ServerEvent>) {
+  private fun sendPictures(dataToSend: List<FilterableEvent<*>>) {
     httpWsTransport.forEachOpenedConnection { client ->
       val readyClientSettings = client.getAttachment<ClientSettings?>() as? ReadyClientSettings ?: return@forEachOpenedConnection
 
       val compressed = with(readyClientSettings.setUpClientData) {
         val requestedData = extractData(readyClientSettings.requestedData)
-        val message = requestedData + dataToSend
+        val message = requestedData + dataToSend.mapNotNull {
+          when (it.isValidForClient(readyClientSettings)) {
+            true -> it.originalEvent
+            false -> null
+          }
+        }
 
         if (message.isEmpty()) {
           return@forEachOpenedConnection
@@ -918,5 +977,9 @@ class ProjectorServer private constructor(
     }
 
     fun getEnvPort() = (getProperty(PORT_PROPERTY_NAME) ?: getProperty(PORT_PROPERTY_NAME_OLD))?.toIntOrNull() ?: DEFAULT_PORT
+  }
+
+  class FilterableEvent<T: ServerEvent>(val originalEvent: T, private val filter: (T, ReadyClientSettings) -> Boolean) {
+    fun isValidForClient(clientSettings: ReadyClientSettings) = filter(originalEvent, clientSettings)
   }
 }
